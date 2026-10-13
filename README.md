@@ -1,4 +1,4 @@
-﻿# AutoHello
+# AutoHello
 
 A small Windows utility that enters your saved PIN into eligible app/browser Windows Hello prompts.
 
@@ -32,7 +32,7 @@ The toggle works while the app is hidden in the tray. Holding it does not repeat
 
 Using the toggle hotkey or tray toggle shows a Windows notification confirming that automatic PIN entry is on or off. If no saved PIN is available, the notification says entry is off and asks you to save a PIN. Windows notification settings may suppress these notifications.
 
-The temporary override is checked during eligibility inspections, so brief taps between checks can be missed. Hold it before typing begins. During paced entry it stops remaining characters and Enter; any characters already sent remain. Other held modifiers postpone entry until release. Attempted and skipped prompts remain blocked across settings changes and pause/resume until AutoHello exits.
+The temporary override is checked during eligibility inspections, so brief taps between checks can be missed. Hold it before typing begins. During paced entry, the worker checks the override every 50 ms while waiting between segments and stops remaining characters and Enter; any characters already sent remain. Focus changes or held modifiers during paced entry cancel only that prompt and leave automatic entry enabled for other prompts, even if the skip key was released before cancellation was processed. Before entry starts, other held modifiers postpone entry until release. Attempted and skipped prompts remain blocked across settings changes and pause/resume until AutoHello exits.
 
 ## Timing
 
@@ -75,7 +75,7 @@ Build and run regression checks on the same executable (exit the tray app first)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test
 ```
 
-Tests use fake focus, input, save, and startup providers; no credentials are read, keys sent, or startup tasks registered. The existing in-memory Task Scheduler definition check requires access to the local service. Checks cover global Save staging and failures, PIN cleanup, default/custom/disabled shortcut persistence, conflicts and cleanup, tray lifecycle, timing, cancellation, process identity, one-attempt rules, and bounded settings reads. Output is saved in `bin/test-results/`.
+Tests use fake focus, input, save, and startup providers; no credentials are read, keys sent, or startup tasks registered. The existing in-memory Task Scheduler definition check requires access to the local service. Checks cover global Save staging and failures, PIN cleanup, default/custom/disabled shortcut persistence, conflicts and cleanup, tray lifecycle, timing, cancellation, process identity, one-attempt rules, and bounded settings reads. Output is printed to the console. Successful runs remove their logs; failed runs retain diagnostics in `bin/test-results/`.
 
 Manual checks: verify custom shortcut capture and Esc, Save/reload, hotkey conflicts, tray toggling, startup registration, and one-attempt behavior in an intentionally opened Hello prompt. Live Windows Hello and global keyboard delivery are not covered by fake-provider tests.
 
@@ -83,9 +83,10 @@ Manual checks: verify custom shortcut capture and Esc, Save/reload, hotkey confl
 
 - `src/Program.cs`: application startup, elevation, and single-instance handling.
 - `src/MainForm.cs`, `MainForm.Layout.cs`, and `MainForm.Settings.cs`: window lifecycle, layout, and settings editing/saving.
-- `src/Automation.cs`, `WindowsAutomation.cs`, and `Native.cs`: worker scheduling, Windows accessibility, and native input.
+- `src/Automation.cs`, `Automation.Pacing.cs`, and `Automation.Types.cs`: worker scheduling/detection, paced entry, and shared identities/interfaces.
+- `src/WindowsAutomation.cs` and `Native.cs`: Windows accessibility, process checks, and native input.
 - `src/DelaySettings.cs`, `Settings.cs`, `ToggleHotkey.cs`, and `StartupTask.cs`: timing, storage, shortcuts, and Windows startup integration.
-- `tests/`: shared self-test runner and safety/storage checks, separate hotkey and scheduling suites, and form tests.
-- `docs/`: automation design notes. `bin/`: ignored generated artifacts and test results.
+- `tests/`: shared self-test runner and fixtures, separate pacing, safety, storage, hotkey, and scheduling suites, and form tests.
+- `docs/`: automation design notes. `bin/` is created as needed for test diagnostics and removed when empty after a successful run.
 
 The build compiles all C# files directly under `src/` and `tests/`. The main executable remains at the project root by default; `-OutputPath` selects another location.

@@ -4,6 +4,8 @@ using System.Text;
 
 internal static class Native
 {
+    // Reuse storage only; process identity and path are queried afresh each time.
+    [ThreadStatic] static StringBuilder processPathBuffer;
     [DllImport("user32.dll")] internal static extern short GetKeyState(int key);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool UnregisterHotKey(IntPtr window, int id);
@@ -15,7 +17,8 @@ internal static class Native
         try {
             long exit, kernel, user;
             if (!GetProcessTimes(process, out created, out exit, out kernel, out user)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            var path = new StringBuilder(512);
+            var path = processPathBuffer ?? (processPathBuffer = new StringBuilder(512));
+            path.Length = 0;
             int length = path.Capacity;
             if (!QueryFullProcessImageName(process, 0, path, ref length)) {
                 int error = Marshal.GetLastWin32Error();

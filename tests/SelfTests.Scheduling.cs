@@ -5,6 +5,38 @@ internal static partial class SelfTests
 {
     static void EventTests()
     {
+        var unrelated = new Fake { Target = null, Readiness = false };
+        using (var worker = new AutomationWorker(unrelated, delegate { }, false)) {
+            worker.Configure("12", false); worker.Step();
+            for (int i = 0; i < 1000; i++) worker.SignalFocusChange();
+            unrelated.Now += worker.NextDelay; worker.Step();
+            Check(unrelated.Inspections == 2 && worker.NextDelay == 2000,
+                "unrelated foreground app cancels rapid readiness polling after one event inspection");
+            unrelated.Readiness = true; worker.SignalFocusChange();
+            unrelated.Now += worker.NextDelay; worker.Step();
+            Check(worker.NextDelay == 100, "broker detection retains rapid delayed-field readiness checks");
+            unrelated.Target = NewTarget(1);
+            unrelated.Now += worker.NextDelay; worker.Step();
+            unrelated.Now += worker.NextDelay; worker.Step();
+            Check(unrelated.Sends == 1, "switching from unrelated app to broker preserves prompt latency");
+        }
+        var transient = new Fake();
+        bool unexpectedlyPaused = false;
+        using (var worker = new AutomationWorker(transient, delegate(int version, string message, bool pause, bool durable) { unexpectedlyPaused |= pause; }, false)) {
+            worker.Configure("12", false, new DelaySettings { StableFocus = 0 });
+            transient.InspectHook = delegate { throw new System.Windows.Automation.ElementNotAvailableException(); };
+            for (int i = 0; i < 6; i++) {
+                worker.Step();
+                Check(!unexpectedlyPaused && worker.State == DetectionState.Watching, "inspection failure never disables configured entry");
+                int calls = transient.Inspections;
+                worker.SignalFocusChange(); worker.Step();
+                Check(transient.Inspections == calls, "focus events cannot bypass automatic detection cooldown");
+                transient.Now += 1000 << Math.Min(i, 3);
+            }
+            transient.InspectHook = null;
+            worker.Step(); worker.Step();
+            Check(transient.Sends == 1 && !unexpectedlyPaused, "detection recovers automatically without reconfiguration");
+        }
         var bounded = new Fake();
         bool capacityPaused = false;
         using (var worker = new AutomationWorker(bounded, delegate(int version, string message, bool pause, bool durable) { if (pause) capacityPaused = true; }, false)) {

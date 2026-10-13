@@ -72,6 +72,41 @@ internal sealed partial class MainForm
         using (var form = new MainForm(false, true, false)) {
             if (form.saveButton.Enabled || form.enabled.Enabled || form.trayEnabled.Enabled || form.SaveAll()) return false;
         }
+        for (int mode = 0; mode < 5; mode++) {
+            using (var form = new MainForm(false, true, true)) {
+                var fake = new SelfTests.Fake();
+                IntPtr handle = form.Handle;
+                form.worker = new AutomationWorker(fake, form.WorkerReport, false);
+                form.activePin = "test-only";
+                form.activeOverride = OverrideKey.Alt;
+                form.activeDelays = new DelaySettings { StableFocus = 0, CharacterInterval = 100 };
+                form.SetRunning(true);
+                form.worker.Step(); form.worker.Step(); form.worker.Step();
+                if (mode == 0) form.worker.SignalFocusChange(); // Skip modifier already released.
+                if (mode == 1) fake.HeldOverride = OverrideKey.Alt;
+                if (mode == 2) fake.Held = true;
+                if (mode == 3) fake.InspectHook = delegate { throw new System.Windows.Automation.ElementNotAvailableException(); };
+                if (mode == 4) fake.ForegroundHook = delegate { throw new System.ComponentModel.Win32Exception(5); };
+                fake.Now = 100; form.worker.Step();
+                Application.DoEvents();
+                if (!form.running || !form.enabled.Checked || !form.trayEnabled.Checked || fake.Sends != 1) return false;
+                fake.HeldOverride = OverrideKey.None; fake.Held = false;
+                fake.InspectHook = null; fake.ForegroundHook = null;
+                if (mode >= 3) {
+                    fake.Now = 1100;
+                    form.worker.Step(); form.worker.Step();
+                    if (fake.Sends != 1) return false; // Never resume a partly entered prompt.
+                }
+                fake.Target = new Target { Window = new IntPtr(99), Process = 77, Created = 2, Field = new[] { 1, 99 } };
+                form.worker.Step(); form.worker.Step(); form.worker.Step();
+                Application.DoEvents();
+                if (!form.enabled.Checked || fake.Sends != 2) return false;
+                // Actual failed input still switches off both controls.
+                fake.Sent = 0; fake.Now += 100; form.worker.Step();
+                Application.DoEvents();
+                if (form.running || form.enabled.Checked || form.trayEnabled.Checked) return false;
+            }
+        }
         return true;
     }
 }

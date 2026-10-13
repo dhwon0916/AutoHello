@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading;
 
 internal static partial class SelfTests
 {
@@ -102,6 +103,64 @@ internal static partial class SelfTests
                 Check(paced.Sends == 1 && worker.State == DetectionState.Attempted, "override cancels remaining characters or Enter without global pause");
                 paced.Target = NewTarget(2); worker.Step(); worker.Step(); worker.Step();
                 Check(paced.Sends == 2, "next prompt works after paced override");
+            }
+        }
+        for (int mode = 0; mode < 4; mode++) {
+            var paced = new Fake();
+            bool paused = false;
+            using (var worker = new AutomationWorker(paced, delegate(int version, string message, bool pause, bool durable) { paused |= pause; }, false)) {
+                worker.Configure("12", true, new DelaySettings { StableFocus = 0,
+                    CharacterInterval = mode % 2 == 0 ? Int32.MaxValue : 0, EnterDelay = Int32.MaxValue }, OverrideKey.Windows);
+                worker.Step(); worker.Step(); worker.Step();
+                Check(paced.Sends == 1 && worker.NextDelay == 50, "long paced waits poll temporary skip");
+                int inspections = paced.Inspections;
+                if (mode < 2) {
+                    paced.HeldOverride = OverrideKey.Windows;
+                    if (mode == 1) worker.SignalFocusChange();
+                    paced.InspectHook = delegate { throw new Exception("Skip must not inspect canceled prompt"); };
+                    paced.Now += 50;
+                } else {
+                    paced.Now = Int32.MaxValue;
+                    paced.InspectHook = delegate {
+                        paced.HeldOverride = OverrideKey.Windows;
+                        if (mode == 2) worker.SignalFocusChange();
+                        else paced.Target = null;
+                    };
+                }
+                worker.Step();
+                Check(!paused && worker.State == DetectionState.Attempted && paced.Sends == 1,
+                    "temporary skip wins over focus and readiness cancellation without disabling entry");
+                if (mode < 2) Check(paced.Inspections == inspections, "skip during wait needs no provider call");
+                paced.InspectHook = null; paced.HeldOverride = OverrideKey.None;
+                paced.Target = NewTarget(1); worker.Step(); worker.Step();
+                Check(paced.Sends == 1, "interrupted prompt stays blocked after skip release");
+                paced.Target = NewTarget(2); worker.Step(); worker.Step(); worker.Step();
+                Check(!paused && paced.Sends == 2, "new prompt enters automatically after skip race");
+            }
+        }
+        // Exercise Run itself: direct Step tests cannot catch a loop that wakes
+        // repeatedly but never samples the override before the segment deadline.
+        for (int mode = 0; mode < 2; mode++) {
+            using (var skipped = new ManualResetEvent(false))
+            using (var unsubscribed = new ManualResetEvent(false)) {
+                var paced = new Fake();
+                paced.SendHook = delegate { paced.HeldOverride = OverrideKey.Shift; };
+                paced.OnUnsubscribe = delegate { unsubscribed.Set(); };
+                bool paused = false;
+                var worker = new AutomationWorker(paced, delegate(int version, string message, bool pause, bool durable) {
+                    paused |= pause;
+                    if (message.StartsWith("Temporary override:")) skipped.Set();
+                }, true);
+                try {
+                    worker.Configure("12", true, new DelaySettings { StableFocus = 0,
+                        CharacterInterval = mode == 0 ? Int32.MaxValue : 0, EnterDelay = Int32.MaxValue }, OverrideKey.Shift);
+                    Check(skipped.WaitOne(3000), "real worker polls skip before long character or Enter deadline");
+                    Check(worker.State == DetectionState.Attempted && !paused && paced.Sends == 1,
+                        "real worker skip preserves enabled state and cancels remaining input");
+                } finally {
+                    worker.Dispose();
+                    Check(unsubscribed.WaitOne(3000), "real skip worker shuts down");
+                }
             }
         }
         string path = Path.Combine(Path.GetTempPath(), "AutoHello-override-" + Guid.NewGuid().ToString("N"));

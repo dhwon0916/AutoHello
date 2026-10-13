@@ -29,5 +29,13 @@ if ($Test) {
     $process = Start-Process -FilePath $OutputPath -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     Get-Content -LiteralPath $stdout, $stderr
     if ($process.ExitCode -ne 0) { throw "Self-tests failed with exit code $($process.ExitCode). See $stderr" }
+    Remove-Item -LiteralPath $stdout, $stderr
+    if (@(Get-ChildItem -LiteralPath $testDirectory -Force).Count -eq 0) {
+        Remove-Item -LiteralPath $testDirectory
+    }
+    $buildDirectory = Split-Path -Parent $testDirectory
+    if (@(Get-ChildItem -LiteralPath $buildDirectory -Force).Count -eq 0) {
+        Remove-Item -LiteralPath $buildDirectory
+    }
     Write-Output 'Self-tests passed.'
 }

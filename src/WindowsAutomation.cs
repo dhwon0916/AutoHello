@@ -51,6 +51,7 @@ internal sealed class WindowsAutomation : IAutomationIO, IFocusEvents
     readonly string expected = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "CredentialUIBroker.exe");
     public long Milliseconds { get { return clock.ElapsedMilliseconds; } }
     public string Status { get; private set; }
+    public bool WatchReadiness { get; private set; }
     volatile bool ignoreOverride;
     internal void IgnoreOverrideUntilRelease() { ignoreOverride = true; }
     public bool OverrideHeld(OverrideKey key)
@@ -89,6 +90,7 @@ internal sealed class WindowsAutomation : IAutomationIO, IFocusEvents
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
     public Target Inspect()
     {
+        WatchReadiness = false;
         Status = "Waiting for Windows Security to be the foreground window.";
         IntPtr window = Native.GetForegroundWindow();
         if (window == IntPtr.Zero) return null;
@@ -96,6 +98,7 @@ internal sealed class WindowsAutomation : IAutomationIO, IFocusEvents
         Native.GetWindowThreadProcessId(window, out pid);
         long created;
         if (!String.Equals(Native.ProcessInfo(pid, out created), expected, StringComparison.OrdinalIgnoreCase)) return null;
+        WatchReadiness = true;
         Status = "Windows Security detected. Focus its PIN box; keep it empty and do not type.";
         // Fetch only eligibility metadata in one request, refreshed on every
         // inspection (including final validation). Never cache protected values.
