@@ -31,18 +31,118 @@ internal static class SelfTests
         public bool StillForeground(Target target) { if (ForegroundHook != null) ForegroundHook(); return Foreground; }
         public uint Send(Native.INPUT[] input) { Sends++; Batch = input; FirstScan = (char)input[0].data.keyboard.scan; if (ThrowSend) throw new InvalidOperationException(); return Sent ?? (uint)input.Length; }
     }
-    static Target NewTarget(long created) { return new Target { Window = new IntPtr(42), Process = 77, Created = created, Field = "pin-field" }; }
+    static void PacedInputTests()
+    {
+        var fake = new Fake();
+        using (var worker = new AutomationWorker(fake, delegate { }, false)) {
+            worker.Configure("12", true, new DelaySettings { StableFocus = 0, CharacterInterval = 100, EnterDelay = 250 });
+            worker.Step(); worker.Step(); worker.Step();
+            Check(fake.Sends == 1 && fake.FirstScan == '1' && fake.Batch.Length == 2, "paced first character"); Cleared(fake);
+            fake.Now = 99; worker.Step(); Check(fake.Sends == 1 && worker.NextDelay == 1, "character delay enforced");
+            fake.Now = 100; worker.Step(); Check(fake.Sends == 2 && fake.FirstScan == '2', "paced second character"); Cleared(fake);
+            fake.Now = 349; worker.Step(); Check(fake.Sends == 2, "Enter delay enforced");
+            fake.Now = 350; worker.Step(); Check(fake.Sends == 3 && fake.FirstScan == '\0', "delayed Enter"); Cleared(fake);
+            worker.Configure("12", true); worker.Step(); fake.Now += 1000; worker.Step();
+            Check(fake.Sends == 3, "paced attempt cannot retry");
+        }
+        for (int mode = 0; mode < 5; mode++) {
+            fake = new Fake();
+            using (var worker = new AutomationWorker(fake, delegate { }, false)) {
+                worker.Configure("12", true, new DelaySettings { StableFocus = 0, CharacterInterval = 100 });
+                worker.Step(); worker.Step(); worker.Step();
+                if (mode == 0) worker.SignalFocusChange();
+                if (mode == 1) fake.Foreground = false;
+                if (mode == 2) fake.Held = true;
+                if (mode == 3) worker.Configure(null, false);
+                if (mode == 4) worker.Dispose();
+                fake.Now = 100; worker.Step();
+                Check(fake.Sends == 1 && worker.State == DetectionState.Paused, "paced cancellation stops remaining input");
+            }
+        }
+        fake = new Fake();
+        using (var worker = new AutomationWorker(fake, delegate { }, false)) {
+            worker.Configure("12", true, new DelaySettings { StableFocus = 0, EnterDelay = 50 });
+            worker.Step(); worker.Step(); worker.Step();
+            Check(fake.Sends == 1 && fake.Batch.Length == 4, "zero character interval batches PIN");
+            fake.Sent = 0; fake.Now = 50; worker.Step();
+            Check(fake.Sends == 2 && worker.State == DetectionState.Paused, "failed paced Enter pauses"); Cleared(fake);
+        }
+        fake = new Fake();
+        using (var worker = new AutomationWorker(fake, delegate { }, false)) {
+            worker.Configure("1", false, new DelaySettings { StableFocus = 0, CharacterInterval = 50, EnterDelay = 100 });
+            worker.Step(); worker.Step(); worker.Step(); fake.Now = 1000; worker.Step();
+            Check(fake.Sends == 1, "Enter preference respected with pacing");
+        }
+        string path = Path.Combine(Path.GetTempPath(), "AutoHello-pacing-" + Guid.NewGuid().ToString("N"));
+        try {
+            File.WriteAllText(path, StoredSettings.Preferences(false, true, new DelaySettings { CharacterInterval = 123, EnterDelay = 456 }));
+            bool enabled, submit; DelaySettings restored;
+            StoredSettings.ReadPreferences(path, out enabled, out submit, out restored);
+            Check(restored.CharacterInterval == 123 && restored.EnterDelay == 456, "pacing persistence");
+            File.WriteAllText(path, "enabled=false\nsubmit=true\ndelays=200,2000,200,100,1500,50\n");
+            StoredSettings.ReadPreferences(path, out enabled, out submit, out restored);
+            Check(restored.CharacterInterval == 0 && restored.EnterDelay == 0, "legacy pacing defaults");
+        } finally { if (File.Exists(path)) File.Delete(path); }
+    }
+
+    static void IdentityTests()
+    {
+        var original = NewTarget(10);
+        var same = NewTarget(10);
+        Check(original.Same(same), "matching target identity");
+        same.Field = new[] { 1, 42, 0 };
+        Check(!original.Same(same), "runtime ID length distinguishes fields");
+        same.Field = null;
+        Check(!original.Same(same), "missing runtime ID fails closed");
+        same.Field = new int[0];
+        Check(!same.Same(same), "empty runtime ID fails closed");
+        same = NewTarget(10);
+        var records = new System.Collections.Generic.HashSet<DialogIdentity>();
+        records.Add(original.Dialog);
+        Check(records.Contains(same.Dialog), "equal identities share hash semantics");
+        same.Field = new[] { 1, 43 };
+        Check(!original.Same(same) && records.Contains(same.Dialog), "new field does not permit dialog retry");
+        Check(!records.Contains(NewTarget(11).Dialog), "process lifetime distinguishes dialog");
+        same = NewTarget(10); same.Process++;
+        Check(!records.Contains(same.Dialog), "process ID distinguishes dialog");
+        same = NewTarget(10); same.Window = new IntPtr(43);
+        Check(!records.Contains(same.Dialog), "window handle distinguishes dialog");
+        Check(PinLabel.Matches("Enter your PIN") && PinLabel.Matches("pin") &&
+            !PinLabel.Matches("spindle") && !PinLabel.Matches("PIN_code") && !PinLabel.Matches(null), "PIN label boundaries");
+        const int count = 100000;
+        var legacy = new System.Collections.Generic.HashSet<string>();
+        legacy.Add(original.Window + ":" + original.Process + ":" + original.Created);
+        records.Contains(original.Dialog); // Warm both lookup paths before measuring.
+        int matches = 0;
+        int collections = GC.CollectionCount(0);
+        var watch = Stopwatch.StartNew();
+        for (int i = 0; i < count; i++)
+            if (legacy.Contains(original.Window + ":" + original.Process + ":" + original.Created)) matches++;
+        watch.Stop();
+        Console.WriteLine("String identity: " + count + " lookups, " + watch.ElapsedMilliseconds + " ms, " + (GC.CollectionCount(0) - collections) + " Gen0 collections");
+        collections = GC.CollectionCount(0); watch.Restart();
+        for (int i = 0; i < count; i++) if (records.Contains(original.Dialog)) matches++;
+        watch.Stop();
+        Console.WriteLine("Value identity: " + count + " lookups, " + watch.ElapsedMilliseconds + " ms, " + (GC.CollectionCount(0) - collections) + " Gen0 collections");
+        Check(matches == count * 2, "identity benchmark lookup results");
+    }
+
+    static Target NewTarget(long created) { return new Target { Window = new IntPtr(42), Process = 77, Created = created, Field = new[] { 1, 42 } }; }
     static void Check(bool result, string name) { if (!result) throw new InvalidOperationException("Self-test: " + name); }
     static void Arm(AutomationWorker worker, Fake fake) { worker.Configure("1234", true); worker.Step(); fake.Now += 900; }
     static void Cleared(Fake fake) { foreach (var input in fake.Batch) Check(input.data.keyboard.scan == 0 && input.data.keyboard.vk == 0, "input zeroed"); }
     internal static void Run()
     {
+        PacedInputTests();
+        IdentityTests();
         EventTests();
+        LatencyTests();
+        DelayTests();
         var fake = new Fake();
         using (var worker = new AutomationWorker(fake, delegate { }, false)) {
             worker.Step(); Check(fake.Inspections == 0, "paused has no inspections");
-            Arm(worker, fake); fake.Now = 699; worker.Step(); Check(fake.Sends == 0, "minimum stable delay");
-            fake.Now = 700; worker.Step(); Check(fake.Sends == 1 && fake.Batch.Length == 10, "one Unicode batch with Enter"); Cleared(fake);
+            Arm(worker, fake); fake.Now = 199; worker.Step(); Check(fake.Sends == 0, "minimum stable delay");
+            fake.Now = 200; worker.Step(); Check(fake.Sends == 1 && fake.Batch.Length == 10, "one Unicode batch with Enter"); Cleared(fake);
             worker.Step(); worker.Configure(null, false); worker.Configure("1234", true); worker.Step(); fake.Now += 900; worker.Step();
             Check(fake.Sends == 1, "no retry after pause/resume");
             fake.Target = null; worker.Step(); fake.Target = NewTarget(1); worker.Step(); fake.Now += 900; worker.Step();
@@ -54,7 +154,7 @@ internal static class SelfTests
             Arm(worker, fake); fake.Foreground = false; worker.Step(); Check(fake.Sends == 0, "foreground change");
             fake.Foreground = true; worker.Step(); fake.Now += 900;
             int finalCall = fake.Inspections + 2;
-            fake.InspectHook = delegate { if (fake.Inspections == finalCall) fake.Target = new Target { Window = new IntPtr(42), Process = 77, Created = 1, Field = "other-field" }; };
+            fake.InspectHook = delegate { if (fake.Inspections == finalCall) fake.Target = new Target { Window = new IntPtr(42), Process = 77, Created = 1, Field = new[] { 1, 43 } }; };
             worker.Step(); Check(fake.Sends == 0, "final focus change");
         }
         fake = new Fake();
@@ -114,7 +214,13 @@ internal static class SelfTests
             AtomicFile.Write(path, Encoding.UTF8.GetBytes(StoredSettings.Preferences(true, false)));
             StoredSettings.ReadPreferences(path, out savedEnabled, out savedSubmit);
             Check(savedEnabled && !savedSubmit, "preferences round trip");
-            foreach (string corrupt in new[] { "", "enabled=maybe\nsubmit=true", "enabled=true\nsubmit=true\nextra=true", new string('x', 1025) }) {
+            DelaySettings timing;
+            StoredSettings.ReadPreferences(path, out savedEnabled, out savedSubmit, out timing);
+            Check(timing.StableFocus == 200, "legacy preferences use default delays");
+            AtomicFile.Write(path, Encoding.UTF8.GetBytes(StoredSettings.Preferences(true, false, DelaySettings.FromValues(new[] { 0, 4000, 5000, 1, 0, Int32.MaxValue }))));
+            StoredSettings.ReadPreferences(path, out savedEnabled, out savedSubmit, out timing);
+            Check(timing.StableFocus == 0 && timing.StabilizationInterval == 5000 && timing.EventSpacing == Int32.MaxValue, "custom delays persist");
+            foreach (string corrupt in new[] { "", "enabled=maybe\nsubmit=true", "enabled=true\nsubmit=true\nextra=true", "enabled=true\nsubmit=true\ndelays=0,0,200,100,1500,50", "enabled=true\nsubmit=true\ndelays=0,1,1,1,0,2147483648", new string('x', 1025) }) {
                 AtomicFile.Write(path, Encoding.UTF8.GetBytes(corrupt));
                 bool rejected = false;
                 try { StoredSettings.ReadPreferences(path, out savedEnabled, out savedSubmit); } catch (InvalidDataException) { rejected = true; }
@@ -169,7 +275,9 @@ internal static class SelfTests
             for (int i = 0; i < 1000; i++) worker.SignalFocusChange();
             Check(!worker.IsLatestNotice(noticeVersion, noticeText), "queued stale focus notice rejected");
             Check(worker.NextDelay == 50, "burst throttled"); fake.Now += 50; worker.Step();
-            Check(fake.Inspections == 7 && worker.NextDelay == 2000, "1000 events coalesced into one inspection");
+            Check(fake.Inspections == 7 && worker.NextDelay == 100, "1000 events coalesced into one inspection and bounded readiness checks");
+            fake.Now += 1500; worker.Step();
+            Check(worker.NextDelay == 2000, "readiness burst expires to idle fallback");
             worker.Configure(null, false); worker.SignalFocusChange(); Check(worker.NextDelay == Timeout.Infinite, "paused events do not schedule inspections");
             Check(!worker.IsLatestNotice(noticeVersion, noticeText), "out-of-order configuration notice rejected");
         }
@@ -181,10 +289,10 @@ internal static class SelfTests
             fake.InspectHook = null; worker.Step(); fake.Now += 900;
             fake.ForegroundHook = delegate { worker.SignalFocusChange(); };
             worker.Step(); Check(fake.Sends == 0, "late focus event rejects final result");
-            fake.ForegroundHook = null; worker.Configure("5678", false); worker.Step(); fake.Now += 699; worker.Step();
+            fake.ForegroundHook = null; worker.Configure("5678", false); worker.Step(); fake.Now += 199; worker.Step();
             Check(fake.Sends == 0, "PIN edit restarts stability"); fake.Now += 1; worker.Step();
             Check(fake.Sends == 1 && fake.FirstScan == '5' && worker.State == DetectionState.Attempted, "edited PIN only after new delay");
-            fake.Target.Field = "recreated-control"; worker.SignalFocusChange(); worker.Step(); fake.Now += 900; worker.Step();
+            fake.Target.Field = new[] { 1, 44 }; worker.SignalFocusChange(); worker.Step(); fake.Now += 900; worker.Step();
             Check(fake.Sends == 1 && worker.State == DetectionState.Attempted, "control recreation cannot retry dialog");
         }
         fake = new Fake { Held = true };
@@ -192,7 +300,7 @@ internal static class SelfTests
             Arm(worker, fake); worker.Step(); Check(fake.Sends == 0, "held modifier postpones input");
             fake.Held = false; worker.Step(); fake.Now += 900;
             fake.ForegroundHook = delegate { fake.Held = true; }; worker.Step(); Check(fake.Sends == 0, "late modifier prevents send");
-            fake.ForegroundHook = null; fake.Held = false; worker.Step(); fake.Now += 699; worker.Step(); Check(fake.Sends == 0, "modifier release restarts delay");
+            fake.ForegroundHook = null; fake.Held = false; worker.Step(); fake.Now += 199; worker.Step(); Check(fake.Sends == 0, "modifier release restarts delay");
             fake.Now++; worker.Step(); Check(fake.Sends == 1, "entry after release and full delay");
         }
         fake = new Fake();
@@ -223,6 +331,48 @@ internal static class SelfTests
                 Check(fake.Sends == 0, "stalled stale result never sends");
             } finally { worker.Dispose(); release.Set(); }
             Check(unsubscribed.WaitOne(3000), "event subscriptions removed after inspection returns");
+        }
+    }
+    static void DelayTests()
+    {
+        var fake = new Fake();
+        using (var worker = new AutomationWorker(fake, delegate { }, false)) {
+            var timing = new DelaySettings { StableFocus = 0 };
+            worker.Configure("1234", false, timing); worker.Step();
+            Check(worker.NextDelay == 0 && fake.Sends == 0, "zero delay still requires final inspection");
+            worker.Step(); Check(fake.Sends == 1, "zero delay sends after revalidation");
+            worker.Configure("1234", false, new DelaySettings()); worker.Step();
+            Check(fake.Sends == 1, "reset cannot retry attempted dialog");
+            fake.Target = NewTarget(2);
+            timing = new DelaySettings { StableFocus = 10000, StabilizationInterval = 5000 };
+            worker.Configure("1234", false, timing); timing.StableFocus = 0;
+            worker.Step(); fake.Now += worker.NextDelay; worker.Step();
+            Check(fake.Sends == 1, "worker owns timing snapshot and long delay");
+            fake.Now += worker.NextDelay; worker.Step(); Check(fake.Sends == 2, "long check interval does not continually restart stability");
+            fake.Target = NewTarget(3); worker.Configure("1234", false, new DelaySettings()); worker.Step();
+            fake.Now += 100; worker.Configure("1234", false, new DelaySettings()); worker.Step();
+            fake.Now += 199; worker.Step(); Check(fake.Sends == 2, "delay change resets pending entry");
+            fake.Now++; worker.Step(); Check(fake.Sends == 3, "default reset timing");
+        }
+    }
+    static void LatencyTests()
+    {
+        var fake = new Fake { Target = null };
+        using (var worker = new AutomationWorker(fake, delegate { }, false)) {
+            worker.Configure("1234", false); worker.Step();
+            fake.Now = 10; worker.SignalFocusChange();
+            fake.Now += worker.NextDelay; worker.Step(); // Event before field creation.
+            fake.Target = NewTarget(1);
+            fake.Now += worker.NextDelay; worker.Step();
+            long detected = fake.Now;
+            while (fake.Sends == 0) {
+                int delay = worker.NextDelay;
+                Check(delay > 0 && delay <= 200, "bounded stabilization schedule");
+                fake.Now += delay; worker.Step();
+                Check(fake.Now <= detected + 200, "no extra stability tick");
+            }
+            Check(detected == 150 && fake.Now == 350, "prompt ready after event sends at 350ms");
+            Console.WriteLine("Fake delayed-field latency: 350 ms from timeline start (700 ms stability version: 850 ms); stable delay is 200 ms.");
         }
     }
     static void Benchmark()

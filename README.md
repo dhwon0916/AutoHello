@@ -12,11 +12,52 @@ A small Windows desktop utility that tries to enter your locally configured PIN 
 
 Do not begin typing into the PIN field yourself while enabled: the app sends the preset PIN without clearing existing text. **Emptiness is not verified.** Protected UI Automation fields do not provide a reliable, general-purpose empty-state check. AutoHello never requests their value, text, or length. After an incorrect PIN, pause and complete the prompt manually, or close it and correct the preset before opening another prompt. There are no automatic retries. Automatic entry and Enter-key preferences are remembered; automatic entry resumes only when running as administrator with a saved PIN. A second instance at the same privilege level is prevented.
 
+## Settings interface
+
+Hover over a setting or advanced delay label for an explanation. Keyboard users can focus a control and press **F1** for the same help. Descriptions are also exposed to accessibility tools.
+
+The compact, resizable window uses standard Windows controls for PIN storage, automatic entry, and timing. Settings scroll while the current state, diagnostic message, and tray/exit actions remain visible. **Hide to tray** keeps the app running; **Exit AutoHello** stops it. When administrator access is missing, the restart button stays available in the footer.
+
+The PIN remains masked by default. **Show PIN** reveals it temporarily and resets when the window loses focus or is hidden. The storage label distinguishes a loaded/saved PIN from unsaved session edits. Editing the PIN pauses automatic entry; enable it again when ready. Advanced timing expands within the scroll area without resizing the window. **Reset to Balanced** restores the default delays.
+
 ## Start with Windows
 
 While running as administrator, check **Start with Windows (as administrator)**. This registers a per-user Task Scheduler task named `AutoHello-<your Windows SID>` using your interactive sign-in token and highest privileges, with no account password stored. At sign-in it launches this executable with `--tray`, without another UAC prompt. Uncheck the option to remove the task. Startup remains off until you enable it.
 
 Save your PIN and enable automatic entry before closing settings if you want entry to resume after sign-in. Keep the executable at the same path. A task pointing to another executable location is shown unchecked; checking startup from the new location replaces the per-user task. If elevation requires a different Windows account, that account has its own PIN storage and startup task.
+
+## Typing speed
+
+Under **Show advanced timing settings**, set **Time between characters** to control PIN typing speed (for example, 100 ms is about ten characters per second). **Wait before Enter** sets the delay after the final character before submission. Click **Apply delays** to save. Enter delay applies only when **Press Enter after the PIN** is checked. Both default to 0 ms, which preserves immediate batched input. Selecting a speed preset or resetting to Balanced also resets these two values to zero.
+
+Paced entry rechecks the eligible field, process identity, foreground window, modifiers, and cancellation before each segment. Focus changes, input failures, or stale inspections stop the remaining input without retrying; a partial PIN may remain for manual completion. Pause, PIN edits, timing changes, and exit cancel pending segments. These checks cannot eliminate the race between checking focus and Windows processing input.
+
+## Adjustable delays
+
+Open settings as administrator and choose an **Entry speed** preset. Selecting a preset applies and saves it immediately:
+
+- **Fast:** 100 ms stable-focus wait, 50 ms readiness checks, and 25 ms event spacing. Gives the prompt less time to settle.
+- **Balanced (default):** 200 ms stable-focus wait, 100 ms readiness checks, and 50 ms event spacing.
+- **Conservative:** 700 ms stable-focus wait; other intervals match Balanced. Allows more settling time but does not eliminate the focus-change race.
+
+All three use a 2,000 ms idle interval, 200 ms stabilization-check interval, and 1,500 ms readiness window. Existing saved timings are preserved and displayed as the matching preset or **Custom**.
+
+The individual controls are under **Advanced settings**, collapsed by default. Choose **Custom** to expand them without changing the active timings, edit **Delays (milliseconds)**, then click **Apply delays**. Values are saved with preferences. **Reset delays** applies Balanced and saves the defaults below; it does not change your PIN, Enter preference, startup task, or attempt history. Applying a preset, custom values, or reset cancels pending entry and starts a fresh stability period if automation is enabled.
+
+| Setting | Default | Minimum |
+| --- | ---: | ---: |
+| Stable focus before entry | 200 ms | 0 ms |
+| Idle fallback interval | 2,000 ms | 1 ms |
+| Stable-focus check interval | 200 ms | 1 ms |
+| Prompt readiness check interval | 100 ms | 1 ms |
+| Prompt readiness window | 1,500 ms | 0 ms |
+| Event burst spacing | 50 ms | 0 ms |
+| Time between characters | 0 ms | 0 ms |
+| Wait before Enter | 0 ms | 0 ms |
+
+All values support up to 2,147,483,647 ms. Zero stable-focus delay removes the settling wait but still requires a separate final eligibility inspection. Zero readiness window disables the short readiness burst; zero event spacing removes event throttling while retaining coalescing. Positive polling intervals prevent a zero-delay polling loop. Short intervals increase CPU use; long intervals delay detection and observe focus less often. Reducing the settling delay increases accidental-entry risk and cannot make Windows authentication instantaneous. The 300 ms stale-inspection limit, failure cooldown, modifier checks, and one-attempt rule remain fixed.
+
+Older preference files load with default delays. Invalid, negative, overflowing, or zero polling intervals in saved settings are rejected. Self-tests cover custom-delay persistence, legacy defaults, zero delay with final validation, long delays, cancellation when timing changes, and reset without permitting retries.
 
 ## Compatibility
 
@@ -32,31 +73,40 @@ The saved PIN is protected using Windows DPAPI for the current Windows account a
 
 PIN and preference writes use a unique temporary file in the same directory, flush it, then replace the destination (or move on first save). The PIN temporary file contains only DPAPI ciphertext. Failed replacement preserves the previous file; errors remain visible. There is no silent fallback to older credentials. Invalid or oversized saved data fails closed with a settings message. A crash can leave an unused `.tmp` file; replacement is not a guarantee against every filesystem or power-loss failure.
 
-The worker keeps one erasable character array while enabled and creates one exact-size input array per attempt, clearing that array in `finally` even if sending throws. Pause and exit clear the worker copy. Managed strings returned by `TextBox.Text`, the native WinForms edit buffer, marshaling, and garbage collector copies cannot be reliably erased; masking and these cleanup measures are not a secure-memory guarantee.
+The worker keeps one erasable character array while enabled and creates an exact-size input array per batch (or per segment when pacing is enabled), clearing that array in `finally` even if sending throws. Pause and exit clear the worker copy. Managed strings returned by `TextBox.Text`, the native WinForms edit buffer, marshaling, and garbage collector copies cannot be reliably erased; masking and these cleanup measures are not a secure-memory guarantee.
 
-## Detection and lifecycle
+See [automation internals](docs/automation.md) for detection, scheduling, cancellation, and attempt-history details.
 
-One background MTA thread owns all UI Automation calls and subscribes to focus-change events. Foreground changes use `SetWinEventHook` with `WINEVENT_OUTOFCONTEXT` on the existing WinForms message-loop thread, including changes to AutoHello's own windows. The callback delegate is rooted until unhooked. Neither callback reads accessibility metadata or stores a PIN: it only invalidates the focus epoch and signals one coalesced request. The foreground hook is removed on the registering UI thread; UIA subscription and removal both run on the MTA worker.
+## Source layout and performance
 
-Enabling schedules immediate inspection. Explicit paused, watching, stabilizing, and attempted states select an infinite paused wait, a two-second missed-event fallback, or 200 ms stabilization checks. Event bursts coalesce into at most one pending request with a 50 ms minimum spacing. There is only one inspection thread and never a queue of work items. While paused, notifications do not schedule inspections. If event registration fails, a diagnostic reports fallback operation. Process handles are still opened afresh: path and creation time are queried together, so a cached PID/path is never trusted. The usual path buffer is 512 characters, growing to 32,768 only when required.
+Application sources live in `src/`, regression checks in `tests/`, and implementation notes in `docs/`. Generated check builds go in the ignored `bin/` directory. The default executable stays at the repository root to preserve existing startup-task paths.
 
-The stable-field delay uses monotonic `Stopwatch` time and remains at least 700 ms; an observation gap over one second restarts it. A complete final eligibility inspection must match the candidate, followed by another foreground/process identity check. Inspections or final validation taking more than 300 ms are discarded. Focus-event epochs and configuration cancellation tokens invalidate results after focus changes, pause/resume, PIN edits, Enter preference changes, or shutdown. Pause/edit cancellation is published before acquiring the short send lock and rechecked immediately before sending. These are stale-result checks, not COM timeouts. A hung provider cannot be safely aborted: the sole worker may remain stuck, but cannot send after cancellation and does not keep the process alive on exit. No replacement workers are spawned. UIA unsubscription must wait for that call to return on its owning thread; the foreground hook can still be removed promptly on the UI thread. Process exit is the final cleanup boundary if a provider never returns.
+- `src/AutoHello.cs`: application entry point and elevation.
+- `src/MainForm.cs`: settings coordination, tray lifecycle, and worker notifications.
+- `src/MainForm.Layout.cs`: interface construction and styling; `tests/MainForm.Tests.cs`: isolated form checks.
+- `src/Automation.cs`: detection state machine and typed dialog identities.
+- `src/WindowsAutomation.cs`: UI Automation inspection, focus hooks, and PIN label matching.
+- `src/Settings.cs`: delay settings, bounded reads, and atomic persistence.
+- `src/StartupTask.cs`: Task Scheduler integration; `src/Native.cs`: native Windows interop.
+- `tests/SelfTests.cs`: fake-provider regression tests and microbenchmarks.
 
-Attempts are marked **before** calling `SendInput`, including zero/partial results or exceptions. Records include HWND, PID, and process creation time, survive pause/resume, and are retained for this app session. Reused HWNDs in a different process lifetime are distinct. Same-process HWND reuse cannot be reliably distinguished from an existing dialog, so it remains blocked, even after an observed disappearance. This deliberately may skip a newly reopened prompt. At 4,096 records automation pauses rather than evicting records and risking a retry. Close credential prompts before restarting AutoHello; attempt history is not persisted across app restarts.
-
-Inspection exceptions and partial/failed input pause automation and update the tray, checkbox, and saved enabled preference together. Inspection failures additionally impose a 1/2/4/8-second capped cooldown across manual re-enables; events cannot bypass it. There are no automatic input retries or automatic re-enables. Ordinary detection transitions are deduplicated, stale queued notices are rejected, and routine notices do not overwrite persistent errors or attempt results. Settings actions or explicitly toggling automation can replace these messages. Identical successfully saved preference values are not written again. Reads enforce size limits on an open file before allocation and reject malformed preferences, invalid UTF-8, invalid DPAPI ciphertext, and oversized decoded PINs. Task Scheduler COM objects are released in reverse ownership order, including intermediate property objects and failure paths. A mismatched startup executable or unexpected task action is reported explicitly and never silently repaired. Form disposal stops the worker and disposes tray resources even when the form was never shown.
-
-Notifications can be delayed or missed, and fallback polling cannot detect every focus excursion. Checks and `SendInput` are not an atomic, target-bound operation: focus can change immediately after validation or while Windows processes the input. Pause/exit cannot retract an input batch already submitted. Held Shift, Ctrl, Alt, or either Windows key postpones entry, resets stability, and returns to the low-frequency fallback until release is observed. AutoHello never releases the user's keys. `GetAsyncKeyState` samples can race or be unavailable; they are another conservative check, not a guarantee. `SendInput` reports inserted events, **not authentication success**; its failure information does not reliably identify UIPI blocking. No secure-desktop bypass or security-policy changes are attempted.
-
-No representative live Hello accessibility tree was inspected during this change. AutomationId values and surrounding control structure remain unverified. Recognition still requires the exact broker path, matching process identity, focused/enabled password Edit control, and an accessible PIN label. No undocumented selectors or additional accepted hosts were added. Recreating the PIN control changes its runtime ID and restarts stabilization before an attempt, but never permits another attempt inside an already-attempted dialog.
+Dialog history uses a value identity containing HWND, PID, and process creation time. Repeated comparisons no longer allocate formatted strings, and each inspection reuses its history lookup. A local 100,000-lookup microbenchmark measured 12 ms / 5 Gen0 collections for string keys and 1 ms / 0 collections for value keys. This does not measure overall application CPU use or authentication speed. Identity tests cover each key component and control recreation; existing cancellation, one-attempt, and history-capacity tests still apply. Form construction suspends outer layout, and label wrapping avoids assigning unchanged size constraints.
 
 ## Build and check
 
 Run `powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1` from this folder. The execution policy option applies only to that build process. Uses the Windows .NET Framework C# compiler and UI Automation assemblies, with no downloads.
 
+Build a separate executable and run all regression checks with one command:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -OutputPath .\bin\AutoHello.checked.exe -Test
+```
+
+The script resolves sources relative to itself and creates the output directory. Relative output paths are resolved from your current directory. Test output is saved beside the executable as `self-test.out.txt` and `self-test.err.txt`; a failing test makes the build command fail. Tests remain compiled into the executable for the existing `--self-test` diagnostic command.
+
 `AutoHello.exe --self-test` exits with code 0 when DPAPI round-trip, native input structure size, PIN label matching, process path lookup, tray close/exit behavior, privilege gating, and in-memory startup task definition checks pass. It also tests fake focus/process/clock/input providers: minimum delay, focus changes, slow/stale inspection, pause/resume generations, duplicate attempts, HWND/PID reuse, partial/failed input, buffer cleanup, and cancellation/shutdown during blocked inspection. Atomic write tests use disposable test files. It neither reads saved credentials nor sends keystrokes, requests elevation, or registers a task. The in-memory scheduler check needs permission to connect to the local Task Scheduler service.
 
-If the normal executable is running, build separately with `powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -OutputPath .\AutoHello.checked.exe`, then run `AutoHello.checked.exe --self-test`. Exit the running tray app before rebuilding the normal executable for use.
+If the normal executable is running, use the separate check build above. Exit the running tray app before rebuilding the normal executable for use.
 
 Additional tests cover 1,000-event bursts, missed-event fallback, stale/out-of-order notices, focus events during inspection/final validation, PIN edits, recreated controls in attempted dialogs, held modifiers, subscription-thread ownership, stalled inspection cleanup, bounded cooldown, the 4,096-attempt limit, corrupt settings, and startup-path classification. All event and input tests use fake providers; live hook delivery and Hello metadata still require manual verification.
 

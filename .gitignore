@@ -3,3 +3,5 @@
 *.pdb
 self-test.out.txt
 self-test.err.txt
+bin/
+obj/

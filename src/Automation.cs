@@ -1,9 +1,28 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Threading;
-using System.Windows.Automation;
+
+// Value identity avoids allocating formatted strings during every inspection.
+// All three fields matter: Windows can reuse handles and process IDs.
+internal struct DialogIdentity : IEquatable<DialogIdentity>
+{
+    readonly IntPtr window;
+    readonly uint process;
+    readonly long created;
+    internal DialogIdentity(IntPtr window, uint process, long created)
+    {
+        this.window = window; this.process = process; this.created = created;
+    }
+    public bool Equals(DialogIdentity other)
+    {
+        return window == other.window && process == other.process && created == other.created;
+    }
+    public override bool Equals(object value) { return value is DialogIdentity && Equals((DialogIdentity)value); }
+    public override int GetHashCode()
+    {
+        unchecked { return ((window.GetHashCode() * 397) ^ process.GetHashCode()) * 397 ^ created.GetHashCode(); }
+    }
+}
 
 // All UIA objects stay on the single MTA worker. Snapshots contain identity only.
 internal sealed class Target
@@ -11,9 +30,16 @@ internal sealed class Target
     internal IntPtr Window;
     internal uint Process;
     internal long Created;
-    internal string Field;
-    internal string Dialog { get { return Window + ":" + Process + ":" + Created; } }
-    internal bool Same(Target other) { return other != null && Dialog == other.Dialog && Field == other.Field; }
+    internal int[] Field;
+    internal DialogIdentity Dialog { get { return new DialogIdentity(Window, Process, Created); } }
+    internal bool Same(Target other)
+    {
+        if (other == null || !Dialog.Equals(other.Dialog) || Field == null || other.Field == null ||
+            Field.Length == 0 || Field.Length != other.Field.Length) return false;
+        for (int i = 0; i < Field.Length; i++)
+            if (Field[i] != other.Field[i]) return false;
+        return true;
+    }
 }
 
 internal interface IAutomationIO
@@ -32,103 +58,21 @@ internal interface IFocusEvents
     void Unsubscribe();
 }
 
-// Created/disposed on the WinForms thread, whose existing message loop delivers
-// out-of-context WinEvents. Never inspect accessibility data in this callback.
-internal sealed class ForegroundEvents : IDisposable
-{
-    delegate void WinEvent(IntPtr hook, uint kind, IntPtr window, int obj, int child, uint thread, uint time);
-    readonly WinEvent callback;
-    GCHandle root;
-    IntPtr hook;
-    internal ForegroundEvents(Action changed)
-    {
-        callback = delegate { changed(); };
-        root = GCHandle.Alloc(callback);
-        hook = SetWinEventHook(3, 3, IntPtr.Zero, callback, 0, 0, 0); // EVENT_SYSTEM_FOREGROUND, OUTOFCONTEXT; include our own windows.
-        if (hook == IntPtr.Zero) { root.Free(); throw new System.ComponentModel.Win32Exception(); }
-    }
-    public void Dispose()
-    {
-        if (hook == IntPtr.Zero) return;
-        // Must be called on the registering thread.
-        if (!UnhookWinEvent(hook)) return; // Keep delegate alive if Windows still owns it.
-        hook = IntPtr.Zero;
-        root.Free();
-    }
-    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module, WinEvent callback, uint process, uint thread, uint flags);
-    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
-}
-
-internal sealed class WindowsAutomation : IAutomationIO, IFocusEvents
-{
-    AutomationFocusChangedEventHandler focusChanged;
-    readonly Stopwatch clock = Stopwatch.StartNew();
-    readonly string expected = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "CredentialUIBroker.exe");
-    public long Milliseconds { get { return clock.ElapsedMilliseconds; } }
-    public string Status { get; private set; }
-    public bool ModifiersHeld {
-        get {
-            // High bit is current down state. Never release or synthesize user keys.
-            return (GetAsyncKeyState(0x10) & 0x8000) != 0 || (GetAsyncKeyState(0x11) & 0x8000) != 0 ||
-                (GetAsyncKeyState(0x12) & 0x8000) != 0 || (GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0;
-        }
-    }
-    public void Subscribe(Action changed)
-    {
-        focusChanged = delegate { changed(); }; // Do not dereference the event's AutomationElement.
-        Automation.AddAutomationFocusChangedEventHandler(focusChanged);
-    }
-    public void Unsubscribe()
-    {
-        if (focusChanged != null) Automation.RemoveAutomationFocusChangedEventHandler(focusChanged);
-        focusChanged = null;
-    }
-    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
-    public Target Inspect()
-    {
-        Status = "Waiting for Windows Security to be the foreground window.";
-        IntPtr window = Native.GetForegroundWindow();
-        if (window == IntPtr.Zero) return null;
-        uint pid;
-        Native.GetWindowThreadProcessId(window, out pid);
-        long created;
-        if (!String.Equals(Native.ProcessInfo(pid, out created), expected, StringComparison.OrdinalIgnoreCase)) return null;
-        Status = "Windows Security detected. Focus its PIN box; keep it empty and do not type.";
-        var focused = AutomationElement.FocusedElement;
-        if (focused == null) return null;
-        var info = focused.Current;
-        if (info.ProcessId != pid || !info.IsPassword || !info.HasKeyboardFocus || !info.IsEnabled || info.ControlType != ControlType.Edit) return null;
-        if (!MainForm.PinName(info.Name) && (info.LabeledBy == null || !MainForm.PinName(info.LabeledBy.Current.Name))) {
-            Status = "Focused password field has no accessible PIN label. Entry skipped."; return null;
-        }
-        Status = "PIN field detected. Waiting for stable focus; emptiness is not verified.";
-        // Never request ValuePattern.Value, TextPattern text, or password length.
-        var target = new Target { Window = window, Process = pid, Created = created, Field = String.Join(".", focused.GetRuntimeId()) };
-        return StillForeground(target) ? target : null;
-    }
-    public bool StillForeground(Target target)
-    {
-        if (Native.GetForegroundWindow() != target.Window) return false;
-        uint pid;
-        Native.GetWindowThreadProcessId(target.Window, out pid);
-        if (pid != target.Process) return false;
-        long created;
-        return String.Equals(Native.ProcessInfo(pid, out created), expected, StringComparison.OrdinalIgnoreCase) && created == target.Created && Native.GetForegroundWindow() == target.Window;
-    }
-    public uint Send(Native.INPUT[] input) { return Native.SendInput((uint)input.Length, input, Marshal.SizeOf(typeof(Native.INPUT))); }
-}
-
 internal enum DetectionState { Paused, Watching, Stabilizing, Attempted }
 
 internal sealed class AutomationWorker : IDisposable
 {
+    DelaySettings delays = new DelaySettings();
     readonly object gate = new object();
     readonly AutoResetEvent wake = new AutoResetEvent(false);
     readonly IAutomationIO io;
     readonly Action<int, string, bool, bool> report;
     readonly Thread thread;
-    readonly HashSet<string> attempted = new HashSet<string>();
+    readonly HashSet<DialogIdentity> attempted = new HashSet<DialogIdentity>();
     char[] secret;
+    Target pacedTarget;
+    int pacedIndex, pacedEpoch;
+    long pacedDue;
     bool submit, stopped;
     int generation;
     int cancellation;
@@ -136,6 +80,7 @@ internal sealed class AutomationWorker : IDisposable
     int candidateEpoch;
     int failures;
     long notBefore, lastInspection = -50;
+    long readinessUntil;
     bool pending;
     DetectionState state;
     string eventWarning;
@@ -157,13 +102,21 @@ internal sealed class AutomationWorker : IDisposable
         Interlocked.Increment(ref focusEpoch); // Invalidate even if Send's short lock is held.
         lock (gate) {
             if (stopped || secret == null) return;
+            readinessUntil = io.Milliseconds + delays.ReadinessWindow;
             candidate = null; state = DetectionState.Watching; pending = true; wake.Set();
         }
     }
     internal int NextDelay {
         get { lock (gate) {
             if (stopped || secret == null) return Timeout.Infinite;
-            long due = pending ? lastInspection + 50 : lastInspection + (state == DetectionState.Stabilizing ? 200 : 2000);
+            if (pacedTarget != null) return (int)Math.Max(0, Math.Min(Int32.MaxValue, pacedDue - io.Milliseconds));
+            long due = pending ? lastInspection + delays.EventSpacing : lastInspection + (state == DetectionState.Stabilizing ? delays.StabilizationInterval : delays.IdleInterval);
+            // A foreground/focus event often precedes creation of the PIN edit.
+            // Briefly bridge that gap without increasing steady-state idle polling.
+            if (!pending && state == DetectionState.Watching && io.Milliseconds < readinessUntil)
+                due = Math.Min(due, lastInspection + delays.ReadinessInterval);
+            if (!pending && state == DetectionState.Stabilizing && candidate != null)
+                due = Math.Min(due, since + delays.StableFocus);
             return (int)Math.Max(0, Math.Min(Int32.MaxValue, Math.Max(due, notBefore) - io.Milliseconds));
         } }
     }
@@ -176,8 +129,10 @@ internal sealed class AutomationWorker : IDisposable
             thread.Start();
         }
     }
-    internal int Configure(string pin, bool enter)
+    internal int Configure(string pin, bool enter, DelaySettings timing = null)
     {
+        DelaySettings next = timing == null ? new DelaySettings() : timing.Copy();
+        next.Validate();
         // Publish cancellation before waiting for the short send/configuration lock.
         int requested = Interlocked.Increment(ref cancellation);
         lock (gate) {
@@ -185,14 +140,16 @@ internal sealed class AutomationWorker : IDisposable
             ClearSecret();
             secret = String.IsNullOrEmpty(pin) ? null : pin.ToCharArray();
             submit = enter;
+            delays = next;
             generation = requested;
+            readinessUntil = 0;
             candidate = null; state = secret == null ? DetectionState.Paused : DetectionState.Watching;
-            pending = secret != null; lastInspection = io.Milliseconds - 50;
+            pending = secret != null; lastInspection = io.Milliseconds - delays.EventSpacing;
             wake.Set();
             return requested;
         }
     }
-    void ClearSecret() { if (secret != null) Array.Clear(secret, 0, secret.Length); secret = null; state = DetectionState.Paused; }
+    void ClearSecret() { pacedTarget = null; if (secret != null) Array.Clear(secret, 0, secret.Length); secret = null; state = DetectionState.Paused; }
     void Run()
     {
         var events = io as IFocusEvents;
@@ -216,6 +173,8 @@ internal sealed class AutomationWorker : IDisposable
     bool Current(int version) { return !stopped && secret != null && generation == version && Thread.VolatileRead(ref cancellation) == version; }
     internal void Step()
     {
+        lock (gate) { if (stopped || secret == null) return; }
+        if (StepPaced()) return;
         int version, epoch;
         lock (gate) {
             if (stopped || secret == null || io.Milliseconds < notBefore) return;
@@ -229,7 +188,8 @@ internal sealed class AutomationWorker : IDisposable
                 if (!Current(version) || epoch != Thread.VolatileRead(ref focusEpoch)) return;
                 failures = 0;
                 bool modifiers = io.ModifiersHeld;
-                string notice = target != null && attempted.Contains(target.Dialog)
+                bool alreadyAttempted = target != null && attempted.Contains(target.Dialog);
+                string notice = alreadyAttempted
                     ? "Already attempted this dialog identity. No retry, including after pause/resume. Complete the prompt manually."
                     : modifiers && target != null ? "Modifier key held. Entry postponed; release modifiers and leave the PIN field empty." : io.Status;
                 notice += eventWarning;
@@ -242,14 +202,14 @@ internal sealed class AutomationWorker : IDisposable
                     report(version, lastStatus, false, false);
                 }
                 if (target == null || io.Milliseconds - started > 300) { candidate = null; state = DetectionState.Watching; return; }
-                if (attempted.Contains(target.Dialog)) { candidate = null; state = DetectionState.Attempted; return; }
+                if (alreadyAttempted) { candidate = null; state = DetectionState.Attempted; return; }
                 if (modifiers) { candidate = null; state = DetectionState.Watching; return; }
-                if (candidateGeneration != version || candidateEpoch != epoch || !target.Same(candidate) || io.Milliseconds - lastObservation > 1000) {
+                if (candidateGeneration != version || candidateEpoch != epoch || !target.Same(candidate) || io.Milliseconds - lastObservation > Math.Max(1000L, (long)delays.StabilizationInterval + 1000)) {
                     state = DetectionState.Stabilizing;
                     candidate = target; candidateGeneration = version; candidateEpoch = epoch; since = lastObservation = io.Milliseconds; return;
                 }
                 lastObservation = io.Milliseconds;
-                if (io.Milliseconds - since < 700) return;
+                if (io.Milliseconds - since < delays.StableFocus) return;
             }
             started = io.Milliseconds;
             Target final = io.Inspect();
@@ -269,6 +229,12 @@ internal sealed class AutomationWorker : IDisposable
                     return;
                 }
                 // Retain tombstones even after destruction: same-process HWND reuse is ambiguous.
+                if (delays.CharacterInterval > 0 || (submit && delays.EnterDelay > 0)) {
+                    if (!attempted.Add(target.Dialog)) return;
+                    pacedTarget = target; pacedIndex = 0; pacedEpoch = epoch; pacedDue = io.Milliseconds;
+                    candidate = null; state = DetectionState.Attempted;
+                    return;
+                }
                 Native.INPUT[] batch = new Native.INPUT[secret.Length * 2 + (submit ? 2 : 0)];
                 try {
                     for (int i = 0; i < secret.Length; i++) {
@@ -298,6 +264,67 @@ internal sealed class AutomationWorker : IDisposable
             }
         }
     }
+    // Each paced segment gets fresh eligibility checks. Waiting never holds the send lock.
+    bool StepPaced()
+    {
+        Target target; int version, epoch;
+        lock (gate) {
+            if (pacedTarget == null) return false;
+            if (io.Milliseconds < pacedDue) return true;
+            target = pacedTarget; version = generation; epoch = pacedEpoch;
+        }
+        try {
+            long started = io.Milliseconds;
+            Target current = io.Inspect();
+            bool foreground = target.Same(current) && io.StillForeground(target);
+            lock (gate) {
+                if (!Current(version) || pacedTarget != target) return true;
+                if (!foreground || epoch != Thread.VolatileRead(ref focusEpoch) || io.Milliseconds - started > 300 || io.ModifiersHeld) {
+                    StopPaced(version, "Input interrupted because focus or readiness changed. Paused; complete the prompt manually. No retry.");
+                    return true;
+                }
+                bool enter = pacedIndex == secret.Length;
+                int characters = enter ? 0 : delays.CharacterInterval == 0 ? secret.Length : 1;
+                var batch = new Native.INPUT[enter ? 2 : characters * 2];
+                try {
+                    if (enter) { batch[0] = Native.Key(13, '\0', 0); batch[1] = Native.Key(13, '\0', 2); }
+                    else for (int i = 0; i < characters; i++) {
+                        batch[i * 2] = Native.Key(0, secret[pacedIndex + i], 4);
+                        batch[i * 2 + 1] = Native.Key(0, secret[pacedIndex + i], 6);
+                    }
+                    if (!Current(version)) return true;
+                    if (epoch != Thread.VolatileRead(ref focusEpoch) || io.ModifiersHeld) {
+                        StopPaced(version, "Input interrupted. Paused; complete the prompt manually. No retry."); return true;
+                    }
+                    uint sent = io.Send(batch);
+                    if (sent != batch.Length) {
+                        StopPaced(version, "Input blocked or partial. Paused; complete the prompt manually. No retry."); return true;
+                    }
+                    pacedIndex += characters;
+                    if (enter || (pacedIndex == secret.Length && !submit)) {
+                        pacedTarget = null;
+                        report(version, "Input sent once. Authentication success is not verified. No retry for this dialog.", false, true);
+                    } else pacedDue = io.Milliseconds + (pacedIndex == secret.Length ? delays.EnterDelay : delays.CharacterInterval);
+                } finally { Array.Clear(batch, 0, batch.Length); }
+            }
+        } catch (Exception) {
+            lock (gate) {
+                if (Current(version) && pacedTarget == target) {
+                    failures = Math.Min(failures + 1, 4);
+                    notBefore = io.Milliseconds + (1000 << (failures - 1));
+                    StopPaced(version, "Paced input failed. Paused; inspect the prompt manually. No retry.");
+                }
+            }
+        }
+        return true;
+    }
+
+    void StopPaced(int version, string message)
+    {
+        ClearSecret();
+        report(version, message, true, true);
+    }
+
     public void Dispose()
     {
         Interlocked.Increment(ref cancellation);
@@ -308,60 +335,5 @@ internal sealed class AutomationWorker : IDisposable
         }
         // A provider call cannot be safely aborted. Do not join it on the UI thread;
         // the background worker discards its result and disposes its event on return.
-    }
-}
-
-internal static class AtomicFile
-{
-    internal static void Write(string path, byte[] data)
-    {
-        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
-        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try {
-            using (var stream = new System.IO.FileStream(temporary, System.IO.FileMode.CreateNew, System.IO.FileAccess.Write, System.IO.FileShare.None)) {
-                stream.Write(data, 0, data.Length); stream.Flush(true);
-            }
-            if (System.IO.File.Exists(path)) System.IO.File.Replace(temporary, path, null);
-            else System.IO.File.Move(temporary, path);
-        } finally { if (System.IO.File.Exists(temporary)) System.IO.File.Delete(temporary); }
-    }
-}
-
-internal static class StoredSettings
-{
-    internal static byte[] ReadBounded(string path, int maximum)
-    {
-        using (var stream = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read)) {
-            if (stream.Length == 0 || stream.Length > maximum) throw new System.IO.InvalidDataException();
-            using (var reader = new System.IO.BinaryReader(stream)) {
-                int length = (int)stream.Length;
-                byte[] data = reader.ReadBytes(length);
-                if (data.Length != length) throw new System.IO.InvalidDataException();
-                return data;
-            }
-        }
-    }
-    internal static string ReadPin(string path)
-    {
-        byte[] plain = System.Security.Cryptography.ProtectedData.Unprotect(ReadBounded(path, 65536), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
-        try {
-            string value = new System.Text.UTF8Encoding(false, true).GetString(plain);
-            if (value.Length == 0 || value.Length > 127) throw new System.IO.InvalidDataException();
-            return value;
-        } finally { Array.Clear(plain, 0, plain.Length); }
-    }
-    internal static string Preferences(bool enabled, bool submit)
-    {
-        return "enabled=" + (enabled ? "true" : "false") + "\nsubmit=" + (submit ? "true" : "false") + "\n";
-    }
-    internal static void ReadPreferences(string path, out bool enabled, out bool submit)
-    {
-        string value = new System.Text.UTF8Encoding(false, true).GetString(ReadBounded(path, 1024));
-        using (var reader = new System.IO.StringReader(value.TrimStart('\uFEFF'))) {
-            string first = reader.ReadLine(), second = reader.ReadLine();
-            if ((first != "enabled=true" && first != "enabled=false") || (second != "submit=true" && second != "submit=false") || reader.ReadLine() != null)
-                throw new System.IO.InvalidDataException();
-            enabled = first == "enabled=true"; submit = second == "submit=true";
-        }
     }
 }
