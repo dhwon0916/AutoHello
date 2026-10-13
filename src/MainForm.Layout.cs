@@ -47,16 +47,8 @@ internal sealed partial class MainForm
         revealPin.CheckedChanged += delegate { pin.UseSystemPasswordChar = !revealPin.Checked; };
         Deactivate += delegate { revealPin.Checked = false; };
         VisibleChanged += delegate { if (!Visible) revealPin.Checked = false; };
-        var pinActions = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Margin = new Padding(0, 8, 0, 4) };
-        savePinButton = ActionButton("&Save PIN");
-        savePinButton.Enabled = false;
-        savePinButton.Click += delegate { SavePin(); };
-        pinActions.Controls.Add(savePinButton);
-        layout.Controls.Add(pinActions);
-        layout.Controls.Add(pinState);
-        layout = Section(cards, "Automatic entry");
+        layout = Section(cards, "General");
         layout.Controls.Add(enabled);
-        layout.Controls.Add(Copy("Keep the Hello PIN field empty. Do not type while automatic entry is enabled."));
         layout.Controls.Add(submit);
         layout.Controls.Add(startup);
         var restart = ActionButton("Restart as &administrator");
@@ -69,11 +61,9 @@ internal sealed partial class MainForm
         timingPreset.Dock = DockStyle.Top;
         timingPreset.AccessibleName = "Entry speed preset";
         layout.Controls.Add(timingPreset);
-        presetDescription.AutoSize = true;
-        presetDescription.Margin = new Padding(0, 8, 0, 8);
-        layout.Controls.Add(presetDescription);
+
         layout.Controls.Add(showAdvanced);
-        showAdvanced.Text = "Show advanced timing settings";
+        showAdvanced.Text = "Advanced timing";
         var advanced = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Visible = false, Margin = new Padding(0, 12, 0, 0) };
         advanced.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.Controls.Add(advanced);
@@ -85,8 +75,7 @@ internal sealed partial class MainForm
             if (displayingDelays) return;
             if (timingPreset.SelectedIndex == 3) {
                 showAdvanced.Checked = true;
-                presetDescription.Text = "Edit individual delays below, then choose Apply delays.";
-            } else ApplyDelays(DelaySettings.Preset(timingPreset.SelectedIndex));
+            } else StageDelays(DelaySettings.Preset(timingPreset.SelectedIndex));
         };
         advanced.Controls.Add(new Label { Text = "Delays (milliseconds)", AutoSize = true });
         string[] delayLabels = { "Stable focus before entry", "Idle fallback interval", "Stable-focus check interval", "Prompt readiness check interval", "Prompt readiness window", "Event burst spacing", "Time between characters", "Wait before Enter" };
@@ -111,52 +100,48 @@ internal sealed partial class MainForm
             row.Controls.Add(delayInputs[i]); advanced.Controls.Add(row);
         }
         DisplayDelays();
-        var delayButtons = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Margin = new Padding(0, 8, 0, 8) };
-        var applyDelays = ActionButton("&Apply delays");
-        var resetDelays = ActionButton("Reset to &Balanced");
-        applyDelays.Enabled = resetDelays.Enabled = administrator;
-        applyDelays.Click += delegate {
-            int[] values = Array.ConvertAll(delayInputs, delegate(NumericUpDown input) { return Decimal.ToInt32(input.Value); });
-            ApplyDelays(DelaySettings.FromValues(values));
-        };
-        resetDelays.Click += delegate { ApplyDelays(new DelaySettings()); };
-        delayButtons.Controls.Add(applyDelays); delayButtons.Controls.Add(resetDelays); advanced.Controls.Add(delayButtons);
-        advanced.Controls.Add(Copy("Click Apply delays to save your changes."));
+        layout = Section(cards, "Hotkeys");
+        layout.Controls.Add(Copy("Skip current prompt"));
+        overrideSelector.Items.AddRange(new object[] { "None", "Ctrl", "Alt", "Windows", "Shift" });
+        overrideSelector.SelectedIndex = 0;
+        overrideSelector.Enabled = administrator;
+        layout.Controls.Add(overrideSelector);
+        layout.Controls.Add(Copy("Toggle on / off"));
+        toggleSelector.SetShortcut(toggleKey);
+        toggleSelector.Enabled = administrator;
+        layout.Controls.Add(toggleSelector);
+        Explain(overrideSelector, "Hold this modifier while the PIN field is focused to skip that prompt, even after release.");
+        Explain(toggleSelector, "Press your shortcut. Esc sets None. Save to apply. Default: Ctrl + Alt + H.");
         var footer = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Margin = new Padding(0, 8, 0, 0) };
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        status.AutoSize = true;
+        status.AutoSize = false; status.Height = 22; status.Dock = DockStyle.Top; status.AutoEllipsis = true;
         status.Margin = new Padding(0, 6, 0, 8);
         footer.Controls.Add(status);
         var footerActions = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Margin = Padding.Empty };
-        var hide = ActionButton("Hide to &tray");
+        saveButton = ActionButton("&Save");
+        saveButton.Click += delegate { SaveAll(); };
+        saveButton.Enabled = administrator;
+        footerActions.Controls.Add(saveButton);
+        var hide = ActionButton("Hide");
         hide.Click += delegate { Hide(); };
-        var exit = ActionButton("E&xit AutoHello");
+        var exit = ActionButton("E&xit");
         exit.Click += delegate { exiting = true; Close(); };
         footerActions.Controls.Add(restart); footerActions.Controls.Add(hide); footerActions.Controls.Add(exit);
         footer.Controls.Add(footerActions);
-        footer.Controls.Add(Copy("Closing this window hides it to the tray."));
+
         shell.Controls.Add(footer, 0, 1);
-        var forget = ActionButton("&Forget saved PIN");
-        forget.Click += delegate {
-            enabled.Checked = false;
-            try { if (File.Exists(settings)) File.Delete(settings); pin.Clear(); pinState.Text = "No PIN saved"; SetStatus("Saved PIN removed."); }
-            catch { SetStatus("Could not remove the saved PIN file."); }
-        };
-        pinActions.Controls.Add(forget);
-        Explain(pin, "The Windows Hello PIN to enter automatically.");
+        Explain(pin, "Leave the Hello PIN field empty while automatic entry is on. Clear this saved PIN and click Save to forget it.");
         Explain(revealPin, "Show the PIN until this window loses focus.");
-        Explain(savePinButton, "Remember this PIN for your Windows account.");
-        Explain(forget, "Delete the saved PIN and pause automatic entry.");
-        Explain(pinState, "Whether the current PIN is saved.");
+        Explain(saveButton, "Save and apply all settings. Clear the PIN and save to forget it.");
+
         Explain(enabled, "Enter your PIN automatically once per prompt.");
         Explain(submit, "Press Enter automatically after typing the PIN.");
         Explain(startup, "Run AutoHello in the tray when you sign in.");
-        Explain(timingPreset, "Choose a speed preset; changes save immediately.");
-        Explain(presetDescription, settingHelp.GetToolTip(timingPreset));
+        Explain(timingPreset, "Choose a speed preset, then Save. Balanced restores default timing.");
         Explain(showAdvanced, "Adjust individual delays in milliseconds.");
-        Explain(applyDelays, "Save and use these delays.");
-        Explain(resetDelays, "Restore all delays to Balanced defaults.");
-        Explain(restart, "Restart as administrator. Save your PIN first.");
+
+
+        Explain(restart, "Restart as administrator to edit and save settings.");
         Explain(hide, "Keep AutoHello running in the tray.");
         Explain(exit, "Stop AutoHello and close it.");
         Controls.Add(shell);

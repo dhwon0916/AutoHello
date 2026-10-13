@@ -4,6 +4,9 @@ using System.Text;
 
 internal static class Native
 {
+    [DllImport("user32.dll")] internal static extern short GetKeyState(int key);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern bool UnregisterHotKey(IntPtr window, int id);
     internal static string ProcessPath(uint processId) { long created; return ProcessInfo(processId, out created); }
     internal static string ProcessInfo(uint processId, out long created)
     {

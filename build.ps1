@@ -22,8 +22,10 @@ $arguments += $sources.FullName
 if ($LASTEXITCODE -ne 0) { throw 'Compilation failed.' }
 Write-Output "Built $OutputPath"
 if ($Test) {
-    $stdout = Join-Path $outputDirectory 'self-test.out.txt'
-    $stderr = Join-Path $outputDirectory 'self-test.err.txt'
+    $testDirectory = Join-Path $PSScriptRoot 'bin\test-results'
+    New-Item -ItemType Directory -Path $testDirectory -Force | Out-Null
+    $stdout = Join-Path $testDirectory 'self-test.out.txt'
+    $stderr = Join-Path $testDirectory 'self-test.err.txt'
     $process = Start-Process -FilePath $OutputPath -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     Get-Content -LiteralPath $stdout, $stderr
     if ($process.ExitCode -ne 0) { throw "Self-tests failed with exit code $($process.ExitCode). See $stderr" }

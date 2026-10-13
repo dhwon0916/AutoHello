@@ -34,14 +34,46 @@ internal sealed class WindowsAutomation : IAutomationIO, IFocusEvents
 {
     AutomationFocusChangedEventHandler focusChanged;
     readonly Stopwatch clock = Stopwatch.StartNew();
+    readonly CacheRequest inspectionCache = CreateInspectionCache();
+    static CacheRequest CreateInspectionCache()
+    {
+        var request = new CacheRequest { TreeScope = TreeScope.Element };
+        request.Add(AutomationElement.ProcessIdProperty);
+        request.Add(AutomationElement.IsPasswordProperty);
+        request.Add(AutomationElement.HasKeyboardFocusProperty);
+        request.Add(AutomationElement.IsEnabledProperty);
+        request.Add(AutomationElement.ControlTypeProperty);
+        request.Add(AutomationElement.NameProperty);
+        request.Add(AutomationElement.LabeledByProperty);
+        request.Add(AutomationElement.RuntimeIdProperty);
+        return request;
+    }
     readonly string expected = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "CredentialUIBroker.exe");
     public long Milliseconds { get { return clock.ElapsedMilliseconds; } }
     public string Status { get; private set; }
+    volatile bool ignoreOverride;
+    internal void IgnoreOverrideUntilRelease() { ignoreOverride = true; }
+    public bool OverrideHeld(OverrideKey key)
+    {
+        if (ignoreOverride) {
+            if (!ModifiersHeld) ignoreOverride = false;
+            return false;
+        }
+        switch (key) {
+            case OverrideKey.Control: return (GetAsyncKeyState(0x11) & 0x8000) != 0;
+            case OverrideKey.Alt: return (GetAsyncKeyState(0x12) & 0x8000) != 0;
+            case OverrideKey.Windows: return (GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0;
+            case OverrideKey.Shift: return (GetAsyncKeyState(0x10) & 0x8000) != 0;
+            default: return false;
+        }
+    }
     public bool ModifiersHeld {
         get {
             // High bit is current down state. Never release or synthesize user keys.
-            return (GetAsyncKeyState(0x10) & 0x8000) != 0 || (GetAsyncKeyState(0x11) & 0x8000) != 0 ||
+            bool held = (GetAsyncKeyState(0x10) & 0x8000) != 0 || (GetAsyncKeyState(0x11) & 0x8000) != 0 ||
                 (GetAsyncKeyState(0x12) & 0x8000) != 0 || (GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0;
+            if (!held) ignoreOverride = false;
+            return held;
         }
     }
     public void Subscribe(Action changed)
@@ -65,16 +97,20 @@ internal sealed class WindowsAutomation : IAutomationIO, IFocusEvents
         long created;
         if (!String.Equals(Native.ProcessInfo(pid, out created), expected, StringComparison.OrdinalIgnoreCase)) return null;
         Status = "Windows Security detected. Focus its PIN box; keep it empty and do not type.";
-        var focused = AutomationElement.FocusedElement;
+        // Fetch only eligibility metadata in one request, refreshed on every
+        // inspection (including final validation). Never cache protected values.
+        AutomationElement focused;
+        using (inspectionCache.Activate()) focused = AutomationElement.FocusedElement;
         if (focused == null) return null;
-        var info = focused.Current;
+        var info = focused.Cached;
         if (info.ProcessId != pid || !info.IsPassword || !info.HasKeyboardFocus || !info.IsEnabled || info.ControlType != ControlType.Edit) return null;
         if (!PinLabel.Matches(info.Name) && (info.LabeledBy == null || !PinLabel.Matches(info.LabeledBy.Current.Name))) {
             Status = "Focused password field has no accessible PIN label. Entry skipped."; return null;
         }
         Status = "PIN field detected. Waiting for stable focus; emptiness is not verified.";
         // Never request ValuePattern.Value, TextPattern text, or password length.
-        var target = new Target { Window = window, Process = pid, Created = created, Field = focused.GetRuntimeId() };
+        var target = new Target { Window = window, Process = pid, Created = created,
+            Field = (int[])focused.GetCachedPropertyValue(AutomationElement.RuntimeIdProperty) };
         return StillForeground(target) ? target : null;
     }
     public bool StillForeground(Target target)

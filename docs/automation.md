@@ -4,6 +4,10 @@
 
 Control runtime IDs are compared directly as integer sequences, avoiding string formatting during each eligible-field inspection. Missing or empty IDs fail the final identity comparison. Dialog history is independent of the control ID, so recreating a control never permits a second attempt in an already attempted dialog.
 
+Each focused-element lookup batches the eight eligibility and identity properties in an element-only UI Automation cache request. The snapshot is fetched again on every inspection, including final validation; no element snapshot is reused between inspections. A separate label-name read is needed only when the field's own name does not identify a PIN. Protected values and text are never requested. This reduces separate property requests; live Windows Hello latency has not been benchmarked.
+
+During paced entry, a focus notification schedules cancellation immediately instead of waiting for the next character or Enter deadline. An already invalidated attempt pauses without another provider call, and its attempt record remains blocked. Regression checks cover both delays at their maximum supported value.
+
 ## Detection and lifecycle
 
 One background MTA thread owns all UI Automation calls and subscribes to focus-change events. Foreground changes use `SetWinEventHook` with `WINEVENT_OUTOFCONTEXT` on the existing WinForms message-loop thread, including changes to AutoHello's own windows. The callback delegate is rooted until unhooked. Neither callback reads accessibility metadata or stores a PIN: it only invalidates the focus epoch and signals one coalesced request. The foreground hook is removed on the registering UI thread; UIA subscription and removal both run on the MTA worker.

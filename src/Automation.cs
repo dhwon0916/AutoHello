@@ -47,6 +47,7 @@ internal interface IAutomationIO
     long Milliseconds { get; }
     string Status { get; }
     bool ModifiersHeld { get; }
+    bool OverrideHeld(OverrideKey key);
     Target Inspect();
     bool StillForeground(Target target);
     uint Send(Native.INPUT[] input);
@@ -74,6 +75,7 @@ internal sealed class AutomationWorker : IDisposable
     int pacedIndex, pacedEpoch;
     long pacedDue;
     bool submit, stopped;
+    OverrideKey overrideKey;
     int generation;
     int cancellation;
     int focusEpoch;
@@ -109,7 +111,8 @@ internal sealed class AutomationWorker : IDisposable
     internal int NextDelay {
         get { lock (gate) {
             if (stopped || secret == null) return Timeout.Infinite;
-            if (pacedTarget != null) return (int)Math.Max(0, Math.Min(Int32.MaxValue, pacedDue - io.Milliseconds));
+            if (pacedTarget != null) return pacedEpoch != Thread.VolatileRead(ref focusEpoch)
+                ? 0 : (int)Math.Max(0, Math.Min(Int32.MaxValue, pacedDue - io.Milliseconds));
             long due = pending ? lastInspection + delays.EventSpacing : lastInspection + (state == DetectionState.Stabilizing ? delays.StabilizationInterval : delays.IdleInterval);
             // A foreground/focus event often precedes creation of the PIN edit.
             // Briefly bridge that gap without increasing steady-state idle polling.
@@ -129,10 +132,11 @@ internal sealed class AutomationWorker : IDisposable
             thread.Start();
         }
     }
-    internal int Configure(string pin, bool enter, DelaySettings timing = null)
+    internal int Configure(string pin, bool enter, DelaySettings timing = null, OverrideKey temporaryOverride = OverrideKey.None)
     {
         DelaySettings next = timing == null ? new DelaySettings() : timing.Copy();
         next.Validate();
+        if (!Enum.IsDefined(typeof(OverrideKey), temporaryOverride)) throw new ArgumentOutOfRangeException("temporaryOverride");
         // Publish cancellation before waiting for the short send/configuration lock.
         int requested = Interlocked.Increment(ref cancellation);
         lock (gate) {
@@ -140,6 +144,7 @@ internal sealed class AutomationWorker : IDisposable
             ClearSecret();
             secret = String.IsNullOrEmpty(pin) ? null : pin.ToCharArray();
             submit = enter;
+            overrideKey = temporaryOverride;
             delays = next;
             generation = requested;
             readinessUntil = 0;
@@ -171,6 +176,21 @@ internal sealed class AutomationWorker : IDisposable
         }
     }
     bool Current(int version) { return !stopped && secret != null && generation == version && Thread.VolatileRead(ref cancellation) == version; }
+    // Use the same bounded history for attempts and deliberate skips, including
+    // across settings changes. Never clear text or synthesize modifier releases.
+    bool SkipForOverride(Target target, int version)
+    {
+        if (target == null || overrideKey == OverrideKey.None || !io.OverrideHeld(overrideKey)) return false;
+        if (!attempted.Contains(target.Dialog) && attempted.Count >= 4096) {
+            ClearSecret();
+            report(version, "Attempt history is full. Paused. Close all credential prompts before restarting AutoHello.", true, true);
+            return true;
+        }
+        attempted.Add(target.Dialog);
+        pacedTarget = null; candidate = null; state = DetectionState.Attempted;
+        report(version, "Temporary override: skipped this prompt. Complete it manually; other prompts remain enabled.", false, true);
+        return true;
+    }
     internal void Step()
     {
         lock (gate) { if (stopped || secret == null) return; }
@@ -187,10 +207,11 @@ internal sealed class AutomationWorker : IDisposable
             lock (gate) {
                 if (!Current(version) || epoch != Thread.VolatileRead(ref focusEpoch)) return;
                 failures = 0;
+                if (target != null && io.Milliseconds - started <= 300 && !attempted.Contains(target.Dialog) && SkipForOverride(target, version)) return;
                 bool modifiers = io.ModifiersHeld;
                 bool alreadyAttempted = target != null && attempted.Contains(target.Dialog);
                 string notice = alreadyAttempted
-                    ? "Already attempted this dialog identity. No retry, including after pause/resume. Complete the prompt manually."
+                    ? "Already attempted or skipped this dialog identity. No retry, including after pause/resume. Complete the prompt manually."
                     : modifiers && target != null ? "Modifier key held. Entry postponed; release modifiers and leave the PIN field empty." : io.Status;
                 notice += eventWarning;
                 if (lastStatus != notice || statusGeneration != version || statusEpoch != epoch) {
@@ -222,6 +243,7 @@ internal sealed class AutomationWorker : IDisposable
             lock (gate) {
                 if (!Current(version) || epoch != Thread.VolatileRead(ref focusEpoch)) return;
                 if (!foreground || io.Milliseconds - started > 300) { candidate = null; state = DetectionState.Watching; return; }
+                if (SkipForOverride(target, version)) return;
                 if (io.ModifiersHeld) { candidate = null; state = DetectionState.Watching; return; }
                 if (attempted.Count >= 4096) {
                     ClearSecret();
@@ -242,7 +264,9 @@ internal sealed class AutomationWorker : IDisposable
                         batch[i * 2 + 1] = Native.Key(0, secret[i], 6);
                     }
                     if (submit) { batch[batch.Length - 2] = Native.Key(13, '\0', 0); batch[batch.Length - 1] = Native.Key(13, '\0', 2); }
-                    if (io.ModifiersHeld || !Current(version) || epoch != Thread.VolatileRead(ref focusEpoch)) { candidate = null; state = DetectionState.Watching; return; }
+                    if (!Current(version) || epoch != Thread.VolatileRead(ref focusEpoch)) { candidate = null; state = DetectionState.Watching; return; }
+                    if (SkipForOverride(target, version)) return;
+                    if (io.ModifiersHeld) { candidate = null; state = DetectionState.Watching; return; }
                     if (!attempted.Add(target.Dialog)) return;
                     candidate = null; state = DetectionState.Attempted;
                     // Configuration and shutdown serialize with this short native send, never with UIA.
@@ -270,6 +294,12 @@ internal sealed class AutomationWorker : IDisposable
         Target target; int version, epoch;
         lock (gate) {
             if (pacedTarget == null) return false;
+            // A focus event already invalidates this attempt; do not wait for the
+            // next character deadline or call a potentially stalled provider.
+            if (pacedEpoch != Thread.VolatileRead(ref focusEpoch)) {
+                StopPaced(generation, "Input interrupted because focus changed. Paused; complete the prompt manually. No retry.");
+                return true;
+            }
             if (io.Milliseconds < pacedDue) return true;
             target = pacedTarget; version = generation; epoch = pacedEpoch;
         }
@@ -279,6 +309,7 @@ internal sealed class AutomationWorker : IDisposable
             bool foreground = target.Same(current) && io.StillForeground(target);
             lock (gate) {
                 if (!Current(version) || pacedTarget != target) return true;
+                if (foreground && epoch == Thread.VolatileRead(ref focusEpoch) && io.Milliseconds - started <= 300 && SkipForOverride(target, version)) return true;
                 if (!foreground || epoch != Thread.VolatileRead(ref focusEpoch) || io.Milliseconds - started > 300 || io.ModifiersHeld) {
                     StopPaced(version, "Input interrupted because focus or readiness changed. Paused; complete the prompt manually. No retry.");
                     return true;
@@ -293,6 +324,7 @@ internal sealed class AutomationWorker : IDisposable
                         batch[i * 2 + 1] = Native.Key(0, secret[pacedIndex + i], 6);
                     }
                     if (!Current(version)) return true;
+                    if (epoch == Thread.VolatileRead(ref focusEpoch) && SkipForOverride(target, version)) return true;
                     if (epoch != Thread.VolatileRead(ref focusEpoch) || io.ModifiersHeld) {
                         StopPaced(version, "Input interrupted. Paused; complete the prompt manually. No retry."); return true;
                     }

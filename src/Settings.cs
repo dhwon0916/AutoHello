@@ -1,4 +1,6 @@
-﻿using System;
+using System;
+
+internal enum OverrideKey { None, Control, Alt, Windows, Shift }
 
 internal static class AtomicFile
 {
@@ -13,44 +15,6 @@ internal static class AtomicFile
             if (System.IO.File.Exists(path)) System.IO.File.Replace(temporary, path, null);
             else System.IO.File.Move(temporary, path);
         } finally { if (System.IO.File.Exists(temporary)) System.IO.File.Delete(temporary); }
-    }
-}
-
-internal sealed class DelaySettings
-{
-    internal int StableFocus = 200, IdleInterval = 2000, StabilizationInterval = 200,
-        ReadinessInterval = 100, ReadinessWindow = 1500, EventSpacing = 50, CharacterInterval = 0, EnterDelay = 0;
-    internal DelaySettings Copy() { return (DelaySettings)MemberwiseClone(); }
-    internal static DelaySettings Preset(int index)
-    {
-        if (index == 0) return new DelaySettings { StableFocus = 100, ReadinessInterval = 50, EventSpacing = 25 };
-        if (index == 1) return new DelaySettings();
-        if (index == 2) return new DelaySettings { StableFocus = 700 };
-        throw new ArgumentOutOfRangeException("index");
-    }
-    internal int PresetIndex {
-        get {
-            for (int i = 0; i < 3; i++) {
-                int[] expected = Preset(i).Values, actual = Values;
-                bool same = true;
-                for (int j = 0; j < actual.Length; j++) if (actual[j] != expected[j]) same = false;
-                if (same) return i;
-            }
-            return 3;
-        }
-    }
-    internal int[] Values { get { return new[] { StableFocus, IdleInterval, StabilizationInterval, ReadinessInterval, ReadinessWindow, EventSpacing, CharacterInterval, EnterDelay }; } }
-    internal static DelaySettings FromValues(int[] values)
-    {
-        if (values == null || (values.Length != 6 && values.Length != 8)) throw new System.IO.InvalidDataException("Invalid delay count.");
-        var result = new DelaySettings { StableFocus = values[0], IdleInterval = values[1], StabilizationInterval = values[2], ReadinessInterval = values[3], ReadinessWindow = values[4], EventSpacing = values[5], CharacterInterval = values.Length > 6 ? values[6] : 0, EnterDelay = values.Length > 7 ? values[7] : 0 };
-        result.Validate(); return result;
-    }
-    internal void Validate()
-    {
-        int[] values = Values;
-        for (int i = 0; i < values.Length; i++)
-            if (values[i] < ((i == 1 || i == 2 || i == 3) ? 1 : 0)) throw new System.IO.InvalidDataException("Invalid delay.");
     }
 }
 
@@ -77,13 +41,18 @@ internal static class StoredSettings
             return value;
         } finally { Array.Clear(plain, 0, plain.Length); }
     }
-    internal static string Preferences(bool enabled, bool submit, DelaySettings delays = null)
+    internal static string Preferences(bool enabled, bool submit, DelaySettings delays = null, OverrideKey overrideKey = OverrideKey.None, ToggleKey? toggleKey = null)
     {
         string result = "enabled=" + (enabled ? "true" : "false") + "\nsubmit=" + (submit ? "true" : "false") + "\n";
         if (delays != null) {
             delays.Validate();
             result += "delays=" + String.Join(",", Array.ConvertAll(delays.Values, delegate(int value) { return value.ToString(System.Globalization.CultureInfo.InvariantCulture); })) + "\n";
         }
+        if (!Enum.IsDefined(typeof(OverrideKey), overrideKey)) throw new System.IO.InvalidDataException();
+        if (overrideKey != OverrideKey.None) result += "override=" + overrideKey + "\n";
+        ToggleKey shortcut = toggleKey ?? ToggleKey.ControlAltH;
+        shortcut.Validate();
+        result += "toggle=" + shortcut.Serialize() + "\n";
         return result;
     }
     internal static void ReadPreferences(string path, out bool enabled, out bool submit)
@@ -93,21 +62,43 @@ internal static class StoredSettings
     }
     internal static void ReadPreferences(string path, out bool enabled, out bool submit, out DelaySettings delays)
     {
+        OverrideKey ignored;
+        ReadPreferences(path, out enabled, out submit, out delays, out ignored);
+    }
+    internal static void ReadPreferences(string path, out bool enabled, out bool submit, out DelaySettings delays, out OverrideKey overrideKey)
+    {
+        ToggleKey ignored;
+        ReadPreferences(path, out enabled, out submit, out delays, out overrideKey, out ignored);
+    }
+    internal static void ReadPreferences(string path, out bool enabled, out bool submit, out DelaySettings delays, out OverrideKey overrideKey, out ToggleKey toggleKey)
+    {
         delays = new DelaySettings();
+        overrideKey = OverrideKey.None;
+        toggleKey = ToggleKey.ControlAltH;
         string value = new System.Text.UTF8Encoding(false, true).GetString(ReadBounded(path, 1024));
         using (var reader = new System.IO.StringReader(value.TrimStart('\uFEFF'))) {
             string first = reader.ReadLine(), second = reader.ReadLine();
             if ((first != "enabled=true" && first != "enabled=false") || (second != "submit=true" && second != "submit=false"))
                 throw new System.IO.InvalidDataException();
             string third = reader.ReadLine();
-            if (third != null) {
-                if (!third.StartsWith("delays=", StringComparison.Ordinal) || reader.ReadLine() != null) throw new System.IO.InvalidDataException();
+            if (third != null && third.StartsWith("delays=", StringComparison.Ordinal)) {
                 string[] parts = third.Substring(7).Split(',');
                 if (parts.Length != 6 && parts.Length != 8) throw new System.IO.InvalidDataException();
                 int[] values = new int[parts.Length];
                 for (int i = 0; i < values.Length; i++)
                     if (!Int32.TryParse(parts[i], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out values[i])) throw new System.IO.InvalidDataException();
                 delays = DelaySettings.FromValues(values);
+                third = reader.ReadLine();
+            }
+            if (third != null && third.StartsWith("override=", StringComparison.Ordinal)) {
+                if (!Enum.TryParse<OverrideKey>(third.Substring(9), out overrideKey) ||
+                    !Enum.IsDefined(typeof(OverrideKey), overrideKey) || third.Substring(9) != overrideKey.ToString()) throw new System.IO.InvalidDataException();
+                third = reader.ReadLine();
+            }
+            if (third != null) {
+                if (!third.StartsWith("toggle=", StringComparison.Ordinal) ||
+                    !ToggleKey.TryParse(third.Substring(7), out toggleKey) ||
+                    reader.ReadLine() != null) throw new System.IO.InvalidDataException();
             }
             enabled = first == "enabled=true"; submit = second == "submit=true";
         }
